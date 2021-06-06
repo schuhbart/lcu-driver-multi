@@ -51,7 +51,7 @@ async def send_message2(connection, target, message):
     res = await r.json()
     url = ""
     for i in res:
-        if i['gameName'].lower() == target:
+        if i['gameName'].lower() == target.lower():
             url = i['id']
     if url != '':
         r = await connection.request('post', '/lol-chat/v1/conversations/' + url + '/messages',
