@@ -2,14 +2,14 @@ import asyncio
 import logging
 from json import loads, JSONDecodeError, dumps
 from typing import Union, Optional, Tuple
-
+import urllib3
 import aiohttp
+import requests
 from aiohttp import ClientConnectorError
 from psutil import Process
 
 from .exceptions import EarlyPerform
 from .utils import parse_cmdline_args
-from .loop import LoopSensitiveManager
 
 logger = logging.getLogger('lcu-driver')
 
@@ -22,10 +22,13 @@ class Connection:
     :param process_or_string: :py:obj:`psutil.Process` object or lockfile string
     :type process_or_string: :py:obj:`psutil.Process` or string
     """
-    def __init__(self, connector, process_or_string: Union[Process, str]):
+    def __init__(self, connector, process_or_string: Union[Process, str], name="", loop=None):
         self._connector = connector
+        self.session = None
         self._ws = None
+        self.loop = loop
         self.locals = {}
+        self.name = name
 
         self._headers = {
             'Content-Type': 'application/json',
@@ -36,7 +39,6 @@ class Connection:
         if isinstance(process_or_string, Process):
             process_args = parse_cmdline_args(process_or_string.cmdline())
 
-            self._lcu_pid = process_or_string.pid
             self._pid = int(process_args['app-pid'])
             self._port = int(process_args['app-port'])
             self._auth_key = process_args['remoting-auth-token']
@@ -45,31 +47,25 @@ class Connection:
         elif isinstance(process_or_string, str):
             lockfile_parts = process_or_string.split(':')
 
-            self._lcu_pid = int(lockfile_parts[0])
             self._pid = int(lockfile_parts[1])
             self._port = int(lockfile_parts[2])
             self._auth_key = lockfile_parts[3]
             self._installation_path = None
-
-        self.session = LoopSensitiveManager(
-            factory=lambda: aiohttp.ClientSession(auth=aiohttp.BasicAuth('riot', self._auth_key), headers=self._headers),
-            callback=lambda x: x.close(),
-        )
 
     async def init(self):
         """Initialize the connection. It's called by the connector when it finds a connection
 
         :rtype: none
         """
+        self.session = aiohttp.ClientSession(auth=aiohttp.BasicAuth('riot', self._auth_key), headers=self._headers)
         setattr(self, 'request', self.request)
 
-        self._connector.register_connection(self)
         tasks = [asyncio.create_task(self._connector.run_event('open', self))]
         await self._wait_api_ready()
 
         tasks.append(asyncio.create_task(self._connector.run_event('ready', self)))
         try:
-            if self._connector.should_run_ws:
+            if len(self._connector.ws.registered_uris) > 0:
                 await self.run_ws()
         except ClientConnectorError:
             logger.info('Client closed unexpectedly')
@@ -79,7 +75,7 @@ class Connection:
 
     async def _close(self):
         await self._connector.run_event('close', self)
-        self._connector.unregister_connection(self._lcu_pid)
+        self._connector.remove_connection()
         await self.session.close()
 
     @property
@@ -152,16 +148,33 @@ class Connection:
     async def request(self, method: str, endpoint: str, **kwargs):
         """Run an HTTP request against the API
 
-        :param method: HTTP method :type method: str :param endpoint: Request Endpoint :type endpoint: str :param
-        kwargs: Arguments for `aiohttp.Request
-        <https://docs.aiohttp.org/en/stable/client_reference.html#aiohttp.request>`_. The **data** keyworded argument
-        will be JSON encoded automatically.
+        :param method: HTTP method
+        :type method: str
+        :param endpoint: Request Endpoint
+        :type endpoint: str
+        :param kwargs: Arguments for `aiohttp.Request <https://docs.aiohttp.org/en/stable/client_reference.html#aiohttp.request>`_. The **data** keyworded argument will be JSON encoded automatically.
         """
         url = self._produce_url(endpoint, **kwargs)
         if kwargs.get('data'):
             kwargs['data'] = dumps(kwargs['data'])
-        session = await self.session.get()
-        return session.request(method, url, verify_ssl=False, **kwargs)
+        try:
+            return await self.session.request(method, url, verify_ssl=False, **kwargs)
+        except:
+            # production ready exception handling
+            return None
+
+    def request_sync(self, method: str, endpoint: str, **kwargs):
+        url = self._produce_url(endpoint, **kwargs)
+        urllib3.disable_warnings()
+        if kwargs.get('data'):
+            kwargs['data'] = dumps(kwargs['data'])
+        if method == 'get':
+            return requests.get(url, verify=False, auth=('riot', self._auth_key), headers=self._headers, **kwargs).json()
+        elif method == 'post':
+            return requests.post(url, verify=False, auth=('riot', self._auth_key), headers=self._headers, **kwargs).json()
+        else:
+            print(f"ERROR: Method {method} is not implemented! Feel free to add it yourself :)")
+            return ""
 
     async def run_ws(self):
         """Start the websoocket connection. This is responsible to raise Connector close event and
